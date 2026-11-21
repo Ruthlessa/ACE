@@ -1,0 +1,7 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ace-video-parser",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true }
+}

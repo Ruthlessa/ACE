@@ -6,3 +6,5 @@ __pycache__/
 *.mkv
 *.mp3
 *.m4a
+.wrangler/
+node_modules/

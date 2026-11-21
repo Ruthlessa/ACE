@@ -32,6 +32,17 @@ python3 web.py        # 默认 8000 端口
 | POST | `/api/parse` | `{"url": "..."}` → 解析结果 JSON |
 | GET | `/api/download?url=...` | 代理下载视频文件 |
 
+## Cloudflare Workers 部署
+
+仓库根目录的 `wrangler.jsonc` + `worker.js` 是网页版的 Worker 实现（功能与 `web.py` 一致），可直接部署：
+
+```bash
+npx wrangler deploy
+```
+
+- 部署命令为 `npx wrangler deploy` 的项目（如 Cloudflare 集成部署）开箱即用
+- Worker 版对非 B 站链接回退为页面 og 元数据解析（无法运行 yt-dlp，仅提供标题/封面等基础信息）
+
 ## 命令行
 
 ```bash
