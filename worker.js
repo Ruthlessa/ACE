@@ -111,25 +111,57 @@ function parseBvid(url) {
   return m ? m[1] : null;
 }
 
-// 412 风控与出口 IP 相关：不同 IP 段对 UA 策略的判定不同，依次尝试多组
-const BILI_ATTEMPTS = [
-  { host: "api.bilibili.com", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
-  { host: "api.bilibili.cn", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
-  {
-    host: "api.bilibili.com",
-    headers: {
-      "User-Agent": DL_HEADERS["User-Agent"],
-      Referer: "https://www.bilibili.com/",
-      Accept: "application/json, text/plain, */*",
-    },
-  },
-  { host: "api.bilibili.com", headers: { Referer: "https://www.bilibili.com/" } },
-];
+// 412 风控按出口 IP + 请求指纹判定：浏览器全套头（sec-ch-ua/sec-fetch）
+// + spi 下发的 buvid3 Cookie + Referer 指向具体视频页才能过，curl UA 仅部分 IP 可用。
+const BROWSER_UA = DL_HEADERS["User-Agent"];
+const SEC_CH_UA = '"Chromium";v="126", "Not:A-Brand";v="24"';
 
-async function biliGet(path, params) {
+let buvid3Cache = null;
+async function getBuvid3() {
+  if (buvid3Cache) return buvid3Cache;
+  try {
+    const r = await fetch("https://api.bilibili.com/x/frontend/finger/spi", {
+      headers: { "User-Agent": BROWSER_UA },
+    });
+    if (r.ok) {
+      const d = await r.json();
+      if (d?.data?.b_3) buvid3Cache = d.data.b_3;
+    }
+  } catch {
+    /* 拿不到就无 Cookie 重试 */
+  }
+  return buvid3Cache;
+}
+
+async function biliGet(path, params, referer) {
   const qs = new URLSearchParams(params);
+  const ref = referer || "https://www.bilibili.com/";
+  const buvid3 = await getBuvid3();
+
+  const browserHeaders = (cookie) => ({
+    "User-Agent": BROWSER_UA,
+    Referer: ref,
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "sec-ch-ua": SEC_CH_UA,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-site": "same-site",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    ...(cookie ? { Cookie: `buvid3=${cookie}` } : {}),
+  });
+
+  const attempts = [
+    { host: "api.bilibili.com", headers: browserHeaders(buvid3) },
+    { host: "api.bilibili.com", headers: browserHeaders(null) },
+    { host: "api.bilibili.cn", headers: browserHeaders(buvid3) },
+    { host: "api.bilibili.com", headers: { "User-Agent": "curl/8.5.0", Referer: ref } },
+    { host: "api.bilibili.cn", headers: { "User-Agent": "curl/8.5.0", Referer: ref } },
+  ];
+
   let lastStatus = 0;
-  for (const { host, headers } of BILI_ATTEMPTS) {
+  for (const { host, headers } of attempts) {
     let r;
     try {
       r = await fetch(`https://${host}${path}?${qs}`, { headers });
@@ -145,16 +177,20 @@ async function biliGet(path, params) {
     if (data.code !== 0) throw new Error(`B 站 API 错误: ${data.code} ${data.message}`);
     return data.data;
   }
-  throw new Error(`B 站 API HTTP ${lastStatus || "网络错误"}（全部 UA 策略被风控）`);
+  throw new Error(`B 站 API HTTP ${lastStatus || "网络错误"}（全部请求指纹被风控）`);
 }
 
 async function extractBili(url) {
   const bvid = parseBvid(url);
   if (!bvid) throw new Error(`无法从链接提取 BV 号: ${url}`);
-  const view = await biliGet("/x/web-interface/view", { bvid });
-  const play = await biliGet("/x/player/playurl", {
-    bvid, cid: view.cid, qn: 120, fnval: 1, fourk: 1,
-  });
+  // Referer 必须指向具体视频页（首页 Referer 会 412）
+  const ref = `https://www.bilibili.com/video/${bvid}`;
+  const view = await biliGet("/x/web-interface/view", { bvid }, ref);
+  const play = await biliGet(
+    "/x/player/playurl",
+    { bvid, cid: view.cid, qn: 120, fnval: 1, fourk: 1 },
+    ref
+  );
   const stat = view.stat || {};
   const qualities = (play.support_formats || []).map((q) => ({
     qn: q.quality,
