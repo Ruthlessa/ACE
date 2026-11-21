@@ -111,13 +111,41 @@ function parseBvid(url) {
   return m ? m[1] : null;
 }
 
+// 412 风控与出口 IP 相关：不同 IP 段对 UA 策略的判定不同，依次尝试多组
+const BILI_ATTEMPTS = [
+  { host: "api.bilibili.com", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
+  { host: "api.bilibili.cn", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
+  {
+    host: "api.bilibili.com",
+    headers: {
+      "User-Agent": DL_HEADERS["User-Agent"],
+      Referer: "https://www.bilibili.com/",
+      Accept: "application/json, text/plain, */*",
+    },
+  },
+  { host: "api.bilibili.com", headers: { Referer: "https://www.bilibili.com/" } },
+];
+
 async function biliGet(path, params) {
   const qs = new URLSearchParams(params);
-  const r = await fetch(`https://api.bilibili.com${path}?${qs}`, { headers: API_HEADERS });
-  if (!r.ok) throw new Error(`B 站 API HTTP ${r.status}`);
-  const data = await r.json();
-  if (data.code !== 0) throw new Error(`B 站 API 错误: ${data.code} ${data.message}`);
-  return data.data;
+  let lastStatus = 0;
+  for (const { host, headers } of BILI_ATTEMPTS) {
+    let r;
+    try {
+      r = await fetch(`https://${host}${path}?${qs}`, { headers });
+    } catch {
+      continue;
+    }
+    if (r.status === 412) { // 风控，换下一组
+      lastStatus = 412;
+      continue;
+    }
+    if (!r.ok) throw new Error(`B 站 API HTTP ${r.status}`);
+    const data = await r.json();
+    if (data.code !== 0) throw new Error(`B 站 API 错误: ${data.code} ${data.message}`);
+    return data.data;
+  }
+  throw new Error(`B 站 API HTTP ${lastStatus || "网络错误"}（全部 UA 策略被风控）`);
 }
 
 async function extractBili(url) {
