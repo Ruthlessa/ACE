@@ -111,41 +111,94 @@ function parseBvid(url) {
   return m ? m[1] : null;
 }
 
-// 412 风控与出口 IP 相关：不同 IP 段对 UA 策略的判定不同，依次尝试多组
+// 412 风控与出口 IP 相关：不同 IP 段对 UA/host 的判定不同，依次尝试多组。
+// 数据中心 IP 还要求携带设备指纹 cookie（spi 接口获取 buvid3/buvid4）。
+const BROWSER_API_HEADERS = {
+  "User-Agent": DL_HEADERS["User-Agent"],
+  Referer: "https://www.bilibili.com/",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "zh-CN,zh;q=0.9",
+  Origin: "https://www.bilibili.com",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-site": "same-site",
+  "sec-fetch-dest": "empty",
+  "sec-ch-ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
+const CURL_HEADERS = { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" };
 const BILI_ATTEMPTS = [
-  { host: "api.bilibili.com", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
-  { host: "api.bilibili.cn", headers: { "User-Agent": "curl/8.5.0", Referer: "https://www.bilibili.com/" } },
-  {
-    host: "api.bilibili.com",
-    headers: {
-      "User-Agent": DL_HEADERS["User-Agent"],
-      Referer: "https://www.bilibili.com/",
-      Accept: "application/json, text/plain, */*",
-    },
-  },
-  { host: "api.bilibili.com", headers: { Referer: "https://www.bilibili.com/" } },
+  { name: "com-curl", host: "api.bilibili.com", headers: CURL_HEADERS },
+  { name: "cn-curl", host: "api.bilibili.cn", headers: CURL_HEADERS },
+  { name: "cn-browser", host: "api.bilibili.cn", headers: BROWSER_API_HEADERS },
+  { name: "com-browser", host: "api.bilibili.com", headers: BROWSER_API_HEADERS },
+  { name: "com-noUA", host: "api.bilibili.com", headers: { Referer: "https://www.bilibili.com/" } },
 ];
+
+let biliCookie = null;
+let biliCookieAt = 0;
+
+/** 取设备指纹 cookie（5 分钟缓存）；spi 本身被风控时返回 null，后续策略照常尝试。 */
+async function getBiliCookie() {
+  if (biliCookie && Date.now() - biliCookieAt < 5 * 60_000) return biliCookie;
+  for (const ua of [CURL_HEADERS["User-Agent"], BROWSER_API_HEADERS["User-Agent"]]) {
+    try {
+      const r = await fetch("https://api.bilibili.com/x/frontend/finger/spi", {
+        headers: { "User-Agent": ua },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const b3 = j?.data?.b_3;
+      if (b3) {
+        const b4 = j?.data?.b_4;
+        biliCookie = `buvid3=${b3}${b4 ? `; buvid4=${b4}` : ""}; b_nut=${Math.floor(Date.now() / 1000)}`;
+        biliCookieAt = Date.now();
+        return biliCookie;
+      }
+    } catch {
+      /* 换下一个 UA 重试 */
+    }
+  }
+  return null;
+}
 
 async function biliGet(path, params) {
   const qs = new URLSearchParams(params);
-  let lastStatus = 0;
-  for (const { host, headers } of BILI_ATTEMPTS) {
+  const cookie = await getBiliCookie();
+  const log = [];
+  for (const { name, host, headers } of BILI_ATTEMPTS) {
+    const h = { ...headers };
+    if (cookie) h.Cookie = cookie;
     let r;
     try {
-      r = await fetch(`https://${host}${path}?${qs}`, { headers });
+      r = await fetch(`https://${host}${path}?${qs}`, { headers: h, signal: AbortSignal.timeout(10000) });
     } catch {
+      log.push(`${name}=net`);
       continue;
     }
-    if (r.status === 412) { // 风控，换下一组
-      lastStatus = 412;
+    if (!r.ok) {
+      log.push(`${name}=${r.status}`);
       continue;
     }
-    if (!r.ok) throw new Error(`B 站 API HTTP ${r.status}`);
-    const data = await r.json();
-    if (data.code !== 0) throw new Error(`B 站 API 错误: ${data.code} ${data.message}`);
+    let data;
+    try {
+      data = await r.json();
+    } catch {
+      log.push(`${name}=badjson`);
+      continue;
+    }
+    if (data.code !== 0) {
+      log.push(`${name}=${data.code}`);
+      continue;
+    }
     return data.data;
   }
-  throw new Error(`B 站 API HTTP ${lastStatus || "网络错误"}（全部 UA 策略被风控）`);
+  const detail = log.join(", ");
+  if (log.length && log.every((l) => l.endsWith("=412"))) {
+    throw new Error(`B 站 API HTTP 412（全部 UA 策略被风控: ${detail}）`);
+  }
+  throw new Error(`B 站 API 请求全部失败（${detail}）`);
 }
 
 async function extractBili(url) {
