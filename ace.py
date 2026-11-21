@@ -29,7 +29,7 @@ DL_HEADERS = {
 QN_LABELS = {16: "360P", 32: "480P", 64: "720P", 80: "1080P", 112: "1080P+", 116: "1080P60", 120: "4K"}
 
 
-# ---------- B 站 ----------
+# ---------- 解析核心（CLI 与网页共用） ----------
 
 def parse_bvid(url: str) -> str | None:
     m = re.search(r"(BV[0-9A-Za-z]{10})", url)
@@ -45,40 +45,74 @@ def bili_get(path: str, params: dict) -> dict:
     return data["data"]
 
 
-def bili_parse(url: str, json_out: bool) -> int:
+def extract_bili(url: str) -> dict:
+    """解析 B 站链接，返回统一结构的字典。"""
     bvid = parse_bvid(url)
     if not bvid:
-        print(f"无法从链接提取 BV 号: {url}", file=sys.stderr)
-        return 1
+        raise ValueError(f"无法从链接提取 BV 号: {url}")
     view = bili_get("/x/web-interface/view", {"bvid": bvid})
-    cid = view["cid"]
-
-    if json_out:
-        print(json.dumps(view, ensure_ascii=False, indent=2))
-        return 0
-
-    stat = view.get("stat", {})
-    print(f"标题:   {view.get('title')}")
-    print(f"UP 主:  {view.get('owner', {}).get('name')}")
-    print(f"时长:   {view.get('duration')} 秒")
-    print(f"播放:   {stat.get('view')}  点赞: {stat.get('like')}  弹幕: {stat.get('danmaku')}")
-    print(f"封面:   {view.get('pic')}")
-    print(f"BV:     {bvid}  cid: {cid}")
-
     play = bili_get(
         "/x/player/playurl",
-        {"bvid": bvid, "cid": cid, "qn": 120, "fnval": 1, "fourk": 1},
+        {"bvid": bvid, "cid": view["cid"], "qn": 120, "fnval": 1, "fourk": 1},
     )
-    qualities = play.get("support_formats") or []
-    print("\n可用清晰度:")
-    for q in qualities:
-        print(f"  qn={q.get('quality'):<4} {q.get('new_description') or q.get('display_desc')}")
+    stat = view.get("stat", {})
+    qualities = [
+        {"qn": q.get("quality"), "label": q.get("new_description") or q.get("display_desc")}
+        for q in (play.get("support_formats") or [])
+    ]
     durl = play.get("durl") or []
-    if durl:
-        print(f"\n默认线路 ({QN_LABELS.get(play.get('quality'), play.get('quality'))}):")
-        print(f"  {durl[0]['url'][:110]}...")
-    return 0
+    return {
+        "source": "bilibili",
+        "bvid": bvid,
+        "title": view.get("title"),
+        "author": view.get("owner", {}).get("name"),
+        "duration": view.get("duration"),
+        "views": stat.get("view"),
+        "likes": stat.get("like"),
+        "danmaku": stat.get("danmaku"),
+        "thumbnail": view.get("pic"),
+        "qualities": qualities,
+        "quality": QN_LABELS.get(play.get("quality"), str(play.get("quality"))),
+        "stream_url": durl[0]["url"] if durl else None,
+        "page_url": f"https://www.bilibili.com/video/{bvid}",
+    }
 
+
+def extract_generic(url: str) -> dict:
+    """用 yt-dlp 解析其他站点，返回统一结构的字典。"""
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    formats = info.get("formats") or []
+    return {
+        "source": info.get("extractor_key") or "generic",
+        "title": info.get("title"),
+        "author": info.get("uploader") or info.get("channel"),
+        "duration": info.get("duration"),
+        "views": info.get("view_count"),
+        "likes": None,
+        "danmaku": None,
+        "thumbnail": info.get("thumbnail"),
+        "qualities": [
+            {
+                "qn": f.get("format_id"),
+                "label": f.get("resolution") or f.get("format_note") or f.get("ext") or "?",
+            }
+            for f in formats[-10:]
+        ],
+        "quality": None,
+        "stream_url": None,
+        "page_url": url,
+    }
+
+
+def extract(url: str) -> dict:
+    """根据链接自动选择解析器。"""
+    if parse_bvid(url):
+        return extract_bili(url)
+    return extract_generic(url)
+
+
+# ---------- 下载 ----------
 
 def bili_download(url: str, output: str) -> int:
     bvid = parse_bvid(url)
@@ -109,30 +143,6 @@ def bili_download(url: str, output: str) -> int:
     return 0
 
 
-# ---------- 通用 (yt-dlp) ----------
-
-def generic_parse(url: str, json_out: bool) -> int:
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    if json_out:
-        print(json.dumps(info, ensure_ascii=False, indent=2))
-        return 0
-
-    print(f"标题:   {info.get('title')}")
-    print(f"作者:   {info.get('uploader') or info.get('channel')}")
-    print(f"时长:   {info.get('duration')} 秒")
-    print(f"播放量: {info.get('view_count')}")
-    print(f"封面:   {info.get('thumbnail')}")
-
-    formats = info.get("formats") or []
-    print(f"\n可用格式 ({len(formats)}):")
-    for f in formats[-10:]:
-        res = f.get("resolution") or f.get("format_note") or "?"
-        print(f"  [{f.get('format_id')}] {res:>10}  {f.get('ext')}  {f.get('vcodec') or 'audio'}")
-    return 0
-
-
 def generic_download(url: str, output: str, fmt: str) -> int:
     with yt_dlp.YoutubeDL(
         {"quiet": True, "no_warnings": True, "outtmpl": output, "format": fmt}
@@ -143,6 +153,27 @@ def generic_download(url: str, output: str, fmt: str) -> int:
 
 
 # ---------- CLI ----------
+
+def cmd_parse(url: str, json_out: bool) -> int:
+    info = extract(url)
+    if json_out:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    print(f"标题:   {info['title']}")
+    print(f"作者:   {info['author']}")
+    print(f"时长:   {info['duration']} 秒")
+    print(f"播放:   {info['views']}  点赞: {info['likes']}  弹幕: {info['danmaku']}")
+    print(f"封面:   {info['thumbnail']}")
+    print(f"来源:   {info['source']}")
+    if info["qualities"]:
+        print("\n可用清晰度/格式:")
+        for q in info["qualities"]:
+            print(f"  {q['qn']}: {q['label']}")
+    if info["stream_url"]:
+        print(f"\n默认线路 ({info['quality']}):")
+        print(f"  {info['stream_url'][:110]}...")
+    return 0
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ace", description="ACE 视频解析工具")
@@ -159,14 +190,12 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
-        if parse_bvid(args.url):
-            if args.command == "parse":
-                return bili_parse(args.url, args.json)
-            return bili_download(args.url, args.output)
         if args.command == "parse":
-            return generic_parse(args.url, args.json)
+            return cmd_parse(args.url, args.json)
+        if parse_bvid(args.url):
+            return bili_download(args.url, args.output)
         return generic_download(args.url, args.output, args.format)
-    except (yt_dlp.utils.DownloadError, RuntimeError, requests.RequestException) as e:
+    except (yt_dlp.utils.DownloadError, RuntimeError, ValueError, requests.RequestException) as e:
         print(f"解析失败: {e}", file=sys.stderr)
         return 1
 
