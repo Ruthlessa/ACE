@@ -219,6 +219,46 @@ async function appViewGet(bvid) {
   return data.data;
 }
 
+/* ---- 页面抓取兜底：视频页 HTML 内嵌 __playinfo__（流）与 __INITIAL_STATE__（元数据） ----
+ * 页面供 SEO/分享访问，风控通常松于 API；通了则一次拿到元数据+流。失败抛 page=xxx 明细。 */
+async function pageGet(bvid) {
+  let r;
+  try {
+    r = await fetch(`https://www.bilibili.com/video/${bvid}`, {
+      headers: {
+        "User-Agent": BROWSER_API_HEADERS["User-Agent"],
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+  } catch {
+    throw new Error("page=net");
+  }
+  if (!r.ok) throw new Error(`page=${r.status}`);
+  const html = await r.text();
+  const pi = html.match(/__playinfo__=(\{[\s\S]*?\})<\/script>/);
+  const st = html.match(/__INITIAL_STATE__=(\{[\s\S]*?\});\(function\(/);
+  if (!pi && !st) throw new Error("page=noinfo");
+  let play = null;
+  let view = null;
+  try {
+    if (pi) play = JSON.parse(pi[1]).data || null;
+  } catch {
+    /* 保留 view */
+  }
+  try {
+    if (st) {
+      const v = JSON.parse(st[1]).videoData;
+      if (v && v.cid) view = v; // 页面 videoData 与 view API 同构（title/owner/cid/stat/pic/duration）
+    }
+  } catch {
+    /* 保留 play */
+  }
+  if (!play && !view) throw new Error("page=badjson");
+  return { view, play };
+}
+
 /* ---- ParseDock 解析兜底：B 站直连全被风控时，换第三方出口拿元数据 + 流地址 ---- */
 /**
  * ParseDock（parsedock.kitt.tools，公开匿名 API）：
@@ -253,7 +293,8 @@ async function pdOnce(vurl) {
       const r = await fetch("https://api.parsedock.kitt.tools/v1/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
-        body: JSON.stringify({ url: vurl, action: "resolve" }),
+        // 随机查询参数绕过服务端同 URL 空结果缓存（B 站页面忽略未知参数，解析目标不变）
+        body: JSON.stringify({ url: `${vurl}${vurl.includes("?") ? "&" : "?"}acedl=${crypto.randomUUID().slice(0, 8)}`, action: "resolve" }),
         signal: AbortSignal.timeout(10000),
       });
       if (r.ok) {
@@ -436,6 +477,19 @@ async function extractBili(url) {
       });
     } catch (e) {
       playErr = e;
+    }
+  }
+  if (!view || !play) {
+    // 页面 HTML 兜底：__INITIAL_STATE__ 补 view、__playinfo__ 补 play（一次请求两者都可能拿到）
+    try {
+      const pg = await pageGet(bvid);
+      view = view || pg.view;
+      play = play || pg.play;
+      if (view) viewErr = null;
+      if (play) playErr = null;
+    } catch (e) {
+      // 页面失败明细只并入 view 段（两段都记会重复输出同一 page 错误）
+      if (!view) viewErr = new Error([viewErr?.message, `页面兜底: ${e.message}`].filter(Boolean).join("；"));
     }
   }
   if (!view || !play) {
