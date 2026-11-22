@@ -259,6 +259,85 @@ async function pageGet(bvid) {
   return { view, play };
 }
 
+/* ---- Loader.to 兜底：p.savenow.to 转码托管（支持 B 站，约 30-40s 转出完整 mp4） ----
+ * GET /api/v2/download?format=1080&url=&apikey= → {id, info} → GET /api/progress?id= 轮询
+ * → success=1 后 download_url 为 savenow 托管的 video/mp4 直链。失败抛 loader=xxx 明细。 */
+const LOADER_KEYS = [
+  "dfcb6d76f2f6a9894gjkege8a4ab232222",
+  "f2f6a9894gjkege8a4ab232222dfcb6d",
+  "01a61c3d0b2848cdba1420b7849d4e5d",
+];
+const LOADER_HDR = {
+  Origin: "https://en.loader.to",
+  Referer: "https://en.loader.to/1/",
+  Accept: "application/json, text/plain, */*",
+};
+
+async function loaderResolve(vurl) {
+  const enc = encodeURIComponent(vurl);
+  let task = null;
+  let lastErr = "loader=post";
+  for (const key of LOADER_KEYS) {
+    try {
+      const r = await fetch(`https://p.savenow.to/api/v2/download?format=1080&url=${enc}&apikey=${key}`, {
+        headers: LOADER_HDR,
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!r.ok) {
+        lastErr = `loader=post${r.status}`;
+        continue;
+      }
+      const j = await r.json();
+      if (j.id || j.download_url) {
+        task = j;
+        break;
+      }
+      lastErr = "loader=post-bad";
+    } catch {
+      lastErr = "loader=post-net";
+    }
+  }
+  if (!task) throw new Error(lastErr);
+  const pack = (j) => ({
+    stream_url: j.download_url,
+    title: task.info?.title || j.info?.title,
+    image: task.info?.image || j.info?.image,
+  });
+  if (task.download_url && task.success) return pack(task);
+  lastErr = "loader=timeout";
+  for (let i = 0; i < 16; i++) {
+    await new Promise((res) => setTimeout(res, 3000));
+    try {
+      const r = await fetch(`https://p.savenow.to/api/progress?id=${task.id}&_=${Date.now()}`, {
+        headers: LOADER_HDR,
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!r.ok) {
+        lastErr = `loader=progress${r.status}`;
+        continue;
+      }
+      const j = await r.json();
+      if (j.download_url && j.success) return pack(j);
+      if (j.error || j.success === -1) throw new Error(`loader=${j.error || "failed"}`);
+      lastErr = `loader=${j.text || "progress"}`;
+    } catch (e) {
+      if (String(e.message).startsWith("loader=")) throw e; // 业务失败（j.error）
+      lastErr = "loader=progress-net";
+    }
+  }
+  throw new Error(lastErr);
+}
+
+/** 把 Loader 结果适配成 ParseDock 同形状，复用下方返回模板 */
+function loaderAdapt(t) {
+  const title = String(t.title || "").replace(/_哔哩哔哩_bilibili$|_bilibili$/, "");
+  return {
+    meta: { title, author: null, thumbnail_url: t.image || null, duration_seconds: null },
+    fmt: { source_url: t.stream_url, height: 1080 },
+    fmts: [{ label: "1080P", height: 1080, source_url: t.stream_url }],
+  };
+}
+
 /* ---- ParseDock 解析兜底：B 站直连全被风控时，换第三方出口拿元数据 + 流地址 ---- */
 /**
  * ParseDock（parsedock.kitt.tools，公开匿名 API）：
@@ -493,21 +572,29 @@ async function extractBili(url) {
     }
   }
   if (!view || !play) {
-    // B 站直连取流/元数据不通 → ParseDock 换出口（返回流地址 + 标题/封面）
-    let pd = null;
-    let pdErr = null;
+    // 兜底链：Loader.to（转码托管约30-40s，已实测支持 B 站）→ ParseDock（快，上游不稳）
+    let alt = null;
+    const altErrs = [];
     try {
-      pd = await pdResolve(url);
+      alt = loaderAdapt(await loaderResolve(url));
     } catch (e) {
-      pdErr = e;
+      altErrs.push(`Loader 兜底: ${e.message}`);
     }
-    if (!pd) {
+    if (!alt) {
+      try {
+        alt = await pdResolve(url);
+      } catch (e) {
+        altErrs.push(`ParseDock 兜底: ${e.message}`);
+      }
+    }
+    if (!alt) {
       const parts = [];
       if (viewErr) parts.push(viewErr.message);
       if (playErr) parts.push(playErr.message);
-      parts.push(`ParseDock 兜底: ${pdErr?.message || "失败"}`);
+      parts.push(...altErrs);
       throw new Error(parts.join("；"));
     }
+    const pd = alt;
     const stat = (view && view.stat) || {};
     const { meta, fmt, fmts } = pd;
     const height = fmt.height;
