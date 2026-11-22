@@ -219,6 +219,87 @@ async function appViewGet(bvid) {
   return data.data;
 }
 
+/* ---- 第三方解析站兜底：B 站直连全被风控时，换第三方出口取流（含标题/封面） ---- */
+const JX_HOSTS = ["https://cache.0567890.xyz:4433", "https://api.hls.one:4433"];
+
+const b64enc = (u8) => {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const b64dec = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function aesCbc(keyBytes, iv, data, encrypt) {
+  const kc = await crypto.subtle.importKey("raw", keyBytes, "AES-CBC", false, [encrypt ? "encrypt" : "decrypt"]);
+  const out = await crypto.subtle[encrypt ? "encrypt" : "decrypt"](
+    { name: "AES-CBC", iv: new TextEncoder().encode(iv) },
+    kc,
+    data
+  );
+  return new Uint8Array(out);
+}
+
+/**
+ * 第三方解析站（协议参考 CharlesPikachu/videodl JXM3U8VideoClient）：
+ * POST /Api {tm,url,key,sign}，key=md5(tm+encodedUrl)，sign=key 的 AES-256-CBC 密文（iv=fUU9eRmkYzsgbkEK）；
+ * 响应 {code,data,key,iv} 中 data 为 AES 加密的 JSON {url,name,pic,type}。
+ * 成功返回 {url,name,pic,type}，全部 host 失败时抛出 jx0=..., jx1=... 明细。
+ */
+async function jxParse(vurl) {
+  const enc = encodeURIComponent(vurl);
+  const tm = String(Date.now());
+  const key = md5Hex(tm + enc);
+  // sign 明文为 32 字节 key（16 整除，无填充块）。WebCrypto 必带 PKCS7 → 密文 48 字节，
+  // CBC 前两块与无填充加密完全一致，截取前 32 字节即等价结果。
+  const sigKey = new TextEncoder().encode(md5Hex(key));
+  const ct = await aesCbc(sigKey, "fUU9eRmkYzsgbkEK", new TextEncoder().encode(key), true);
+  const sign = b64enc(ct.slice(0, 32));
+  const body = new URLSearchParams({ tm, url: enc, key, sign });
+  const headers = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    Origin: "https://jx.xmflv.com",
+    Referer: "https://jx.xmflv.com/",
+  };
+  const errs = [];
+  for (let i = 0; i < JX_HOSTS.length; i++) {
+    let r;
+    try {
+      r = await fetch(`${JX_HOSTS[i]}/Api`, { method: "POST", body, headers, signal: AbortSignal.timeout(30000) });
+    } catch {
+      errs.push(`jx${i}=net`);
+      continue;
+    }
+    if (!r.ok) {
+      errs.push(`jx${i}=${r.status}`);
+      continue;
+    }
+    let j;
+    try {
+      j = await r.json();
+    } catch {
+      errs.push(`jx${i}=badjson`);
+      continue;
+    }
+    if (j.code !== 200 || !j.data || !j.key || !j.iv) {
+      errs.push(`jx${i}=${j?.code ?? "?"}`);
+      continue;
+    }
+    try {
+      const plain = await aesCbc(new TextEncoder().encode(String(j.key)), String(j.iv), b64dec(j.data), false);
+      const text = new TextDecoder().decode(plain);
+      const obj = JSON.parse(text.slice(text.indexOf("{")));
+      if (!obj.url) {
+        errs.push(`jx${i}=nourl`);
+        continue;
+      }
+      return obj;
+    } catch {
+      errs.push(`jx${i}=dec`);
+    }
+  }
+  throw new Error(errs.join(", "));
+}
+
 // 412 风控与出口 IP 相关：不同 IP 段对 UA/host 的判定不同，依次尝试多组。
 // 数据中心 IP 还要求携带设备指纹 cookie（spi 接口获取 buvid3/buvid4）。
 const BROWSER_API_HEADERS = {
@@ -323,13 +404,60 @@ async function extractBili(url) {
     // web 端 view 全策略失败（通常为出口 IP 被整段 412 风控）→ 走 app 签名接口兜底
     try {
       view = await appViewGet(bvid);
+      viewErr = null;
     } catch (e) {
-      throw new Error(`${viewErr?.message || "view 失败"}；app 兜底: ${e.message}`);
+      viewErr = new Error(`${viewErr?.message || "view 失败"}；app 兜底: ${e.message}`);
     }
   }
-  const play = await biliGet("/x/player/playurl", {
-    bvid, cid: view.cid, qn: 120, fnval: 1, fourk: 1,
-  });
+  let play = null;
+  let playErr = null;
+  if (view) {
+    try {
+      play = await biliGet("/x/player/playurl", {
+        bvid, cid: view.cid, qn: 120, fnval: 1, fourk: 1,
+      });
+    } catch (e) {
+      playErr = e;
+    }
+  }
+  if (!view || !play) {
+    // B 站直连取流/元数据不通 → 第三方解析站换出口（返回流地址 + 标题/封面）
+    let jx = null;
+    let jxErr = null;
+    try {
+      jx = await jxParse(url);
+    } catch (e) {
+      jxErr = e;
+    }
+    if (!jx) {
+      const parts = [];
+      if (viewErr) parts.push(viewErr.message);
+      if (playErr) parts.push(playErr.message);
+      parts.push(`第三方兜底: ${jxErr?.message || "失败"}`);
+      throw new Error(parts.join("；"));
+    }
+    const stat = (view && view.stat) || {};
+    const jxIsHls = /m3u8|hls/i.test(String(jx.type || "")) || /\.m3u8/i.test(String(jx.url || ""));
+    return {
+      source: "bilibili",
+      bvid,
+      title: view?.title || jx.name || bvid,
+      author: view?.owner?.name,
+      duration: view?.duration,
+      views: stat.view,
+      likes: stat.like,
+      danmaku: stat.danmaku,
+      thumbnail: view?.pic || jx.pic || null,
+      qualities: play
+        ? (play.support_formats || []).map((q) => ({ qn: q.quality, label: q.new_description || q.display_desc }))
+        : [{ qn: 80, label: "解析线路" }],
+      quality: play
+        ? QN_LABELS[play.quality] || String(play.quality)
+        : jxIsHls ? "HLS" : "MP4",
+      stream_url: (play?.durl || [])[0]?.url || jx.url,
+      page_url: `https://www.bilibili.com/video/${bvid}`,
+    };
+  }
   const stat = view.stat || {};
   const qualities = (play.support_formats || []).map((q) => ({
     qn: q.quality,
