@@ -111,6 +111,114 @@ function parseBvid(url) {
   return m ? m[1] : null;
 }
 
+// ---- app.bilibili.com 移动端签名接口：web 端被整段 IP 风控（412）时的兜底通路 ----
+const BILI_APP_KEY = "dfca71928277209b";
+const BILI_APP_SEC = "b5475a8825547a4fc26c7d518eaaa02e";
+const BILI_APP_UA =
+  "Mozilla/5.0 BiliDroid/1.45.0 (bbcallen@gmail.com) os/android model/Pixel6 mobi_app/android_hd build/1450000 channel/bili innerVer/1450000 osVer/13 network/2";
+
+/** 手写 MD5（Workers WebCrypto 无 MD5；输入为 UTF-8 字符串，返回小写 hex）。RFC 1321。 */
+function md5Hex(str) {
+  const bytes = new TextEncoder().encode(str);
+  const len = bytes.length;
+  const buf = new Uint8Array(((len + 8) >> 6 << 6) + 64);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(buf.length - 8, (len * 8) >>> 0, true);
+  dv.setUint32(buf.length - 4, Math.floor((len * 8) / 0x100000000), true);
+
+  const S16 = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000);
+  // 每轮 x 下标序列（RFC 1321 MD5Transform）
+  const XI = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [1, 6, 11, 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12],
+    [5, 8, 11, 14, 1, 4, 7, 10, 13, 0, 3, 6, 9, 12, 15, 2],
+    [0, 7, 14, 5, 12, 3, 10, 1, 8, 15, 6, 13, 4, 11, 2, 9],
+  ];
+  // 每步的目标寄存器与 F 参数（a,b,c,d = 0,1,2,3；步序 a,d,c,b 循环）
+  const TGT = [0, 3, 2, 1];
+  const ARG = [[1, 2, 3], [0, 1, 2], [3, 0, 1], [2, 3, 0]];
+  const R = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  const state = [...R];
+
+  for (let off = 0; off < buf.length; off += 64) {
+    const M = new Uint32Array(16);
+    for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+    for (let i = 0; i < 64; i++) {
+      const t = TGT[i & 3], [q, r, s] = ARG[i & 3];
+      const x = R[q], y = R[r], z = R[s];
+      let f;
+      const rnd = i >> 4;
+      if (rnd === 0) f = (x & y) | (~x & z);
+      else if (rnd === 1) f = (x & z) | (y & ~z);
+      else if (rnd === 2) f = x ^ y ^ z;
+      else f = y ^ (x | ~z);
+      const v = (R[t] + f + M[XI[rnd][i & 15]] + K[i]) >>> 0;
+      const sIdx = rnd * 4 + (i & 3); // 每轮 4 个移位值循环
+      const rot = ((v << S16[sIdx]) | (v >>> (32 - S16[sIdx]))) >>> 0;
+      R[t] = (rot + x) >>> 0;
+    }
+    for (let j = 0; j < 4; j++) {
+      state[j] = (state[j] + R[j]) >>> 0;
+      R[j] = state[j];
+    }
+  }
+  // digest = 状态字的小端字节序
+  const le = (n) =>
+    [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  return le(state[0]) + le(state[1]) + le(state[2]) + le(state[3]);
+}
+
+/** 移动端接口签名：参数按 key 排序 urlencode 后 md5(query+secret)，追加 sign 参数。 */
+function appSign(params) {
+  const p = { ...params, appkey: BILI_APP_KEY };
+  const qs = Object.keys(p)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(String(p[k]))}`)
+    .join("&");
+  return `${qs}&sign=${md5Hex(qs + BILI_APP_SEC)}`;
+}
+
+/** app 端视频信息（与 web 端 view 字段基本一致：title/owner/cid/duration/stat/pic）。 */
+async function appViewGet(bvid) {
+  const qs = appSign({
+    bvid,
+    autoplay: "0",
+    qn: "32",
+    platform: "android",
+    channel: "bili",
+    mobi_app: "android_hd",
+    statistics: JSON.stringify({ appId: 5, platform: 3, version: "1.45.0", abtest: "" }),
+    build: "1450000",
+    c_locale: "zh_CN",
+    s_locale: "zh_CN",
+    ts: String(Math.floor(Date.now() / 1000)),
+  });
+  let r;
+  try {
+    r = await fetch(`https://app.bilibili.com/x/v2/view?${qs}`, {
+      headers: { "User-Agent": BILI_APP_UA, Referer: "https://www.bilibili.com/" },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    throw new Error("app-view net");
+  }
+  if (!r.ok) throw new Error(`app-view HTTP ${r.status}`);
+  let data;
+  try {
+    data = await r.json();
+  } catch {
+    throw new Error("app-view badjson");
+  }
+  if (data.code !== 0) throw new Error(`app-view code ${data.code}`);
+  return data.data;
+}
+
 // 412 风控与出口 IP 相关：不同 IP 段对 UA/host 的判定不同，依次尝试多组。
 // 数据中心 IP 还要求携带设备指纹 cookie（spi 接口获取 buvid3/buvid4）。
 const BROWSER_API_HEADERS = {
@@ -204,7 +312,21 @@ async function biliGet(path, params) {
 async function extractBili(url) {
   const bvid = parseBvid(url);
   if (!bvid) throw new Error(`无法从链接提取 BV 号: ${url}`);
-  const view = await biliGet("/x/web-interface/view", { bvid });
+  let view = null;
+  let viewErr = null;
+  try {
+    view = await biliGet("/x/web-interface/view", { bvid });
+  } catch (e) {
+    viewErr = e;
+  }
+  if (!view) {
+    // web 端 view 全策略失败（通常为出口 IP 被整段 412 风控）→ 走 app 签名接口兜底
+    try {
+      view = await appViewGet(bvid);
+    } catch (e) {
+      throw new Error(`${viewErr?.message || "view 失败"}；app 兜底: ${e.message}`);
+    }
+  }
   const play = await biliGet("/x/player/playurl", {
     bvid, cid: view.cid, qn: 120, fnval: 1, fourk: 1,
   });
