@@ -8,3 +8,6 @@ __pycache__/
 *.m4a
 .wrangler/
 node_modules/
+
+# 用户上传的输入文件不入库
+.uploads/
