@@ -219,85 +219,103 @@ async function appViewGet(bvid) {
   return data.data;
 }
 
-/* ---- 第三方解析站兜底：B 站直连全被风控时，换第三方出口取流（含标题/封面） ---- */
-const JX_HOSTS = ["https://cache.0567890.xyz:4433", "https://api.hls.one:4433"];
-
-const b64enc = (u8) => {
-  let s = "";
-  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
-  return btoa(s);
-};
-const b64dec = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-
-async function aesCbc(keyBytes, iv, data, encrypt) {
-  const kc = await crypto.subtle.importKey("raw", keyBytes, "AES-CBC", false, [encrypt ? "encrypt" : "decrypt"]);
-  const out = await crypto.subtle[encrypt ? "encrypt" : "decrypt"](
-    { name: "AES-CBC", iv: new TextEncoder().encode(iv) },
-    kc,
-    data
-  );
-  return new Uint8Array(out);
-}
-
+/* ---- ParseDock 解析兜底：B 站直连全被风控时，换第三方出口拿元数据 + 流地址 ---- */
 /**
- * 第三方解析站（协议参考 CharlesPikachu/videodl JXM3U8VideoClient）：
- * POST /Api {tm,url,key,sign}，key=md5(tm+encodedUrl)，sign=key 的 AES-256-CBC 密文（iv=fUU9eRmkYzsgbkEK）；
- * 响应 {code,data,key,iv} 中 data 为 AES 加密的 JSON {url,name,pic,type}。
- * 成功返回 {url,name,pic,type}，全部 host 失败时抛出 jx0=..., jx1=... 明细。
+ * ParseDock（parsedock.kitt.tools，公开匿名 API）：
+ * POST /v1/jobs {url, action:"resolve"} → 202 {job_id, job_token}；
+ * GET /v1/jobs/{id}（Authorization: Bearer job_token）轮询 → succeeded 后
+ * result.formats[].source_url 为直连流（B 站 CDN mp4），content_metadata 为标题/作者/封面/时长。
+ * 失败抛明细（pd-post=..., pd=...）。
  */
-async function jxParse(vurl) {
-  const enc = encodeURIComponent(vurl);
-  const tm = String(Date.now());
-  const key = md5Hex(tm + enc);
-  // sign 明文为 32 字节 key（16 整除，无填充块）。WebCrypto 必带 PKCS7 → 密文 48 字节，
-  // CBC 前两块与无填充加密完全一致，截取前 32 字节即等价结果。
-  const sigKey = new TextEncoder().encode(md5Hex(key));
-  const ct = await aesCbc(sigKey, "fUU9eRmkYzsgbkEK", new TextEncoder().encode(key), true);
-  const sign = b64enc(ct.slice(0, 32));
-  const body = new URLSearchParams({ tm, url: enc, key, sign });
-  const headers = {
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    Origin: "https://jx.xmflv.com",
-    Referer: "https://jx.xmflv.com/",
+async function pdOnce(vurl) {
+  // 从 job 对象提取流与元数据；POST 快路径元数据在 content_metadata，轮询路径在 result.*
+  const extract = (j) => {
+    const fmts = (j.result?.formats || []).filter((f) => f.source_url);
+    const fmt = fmts.find((f) => f.browser_usable) || fmts[0];
+    if (!fmt) throw new Error("pd=nourl"); // succeeded 但空结果（服务端降级），可重试
+    const cm = j.content_metadata || {};
+    const rm = j.result || {};
+    const pick = (...vs) => vs.find((v) => v != null);
+    const meta = {
+      title: pick(cm.title, rm.title),
+      author: pick(cm.author, rm.author),
+      thumbnail_url: pick(cm.thumbnail_url, rm.thumbnail_url),
+      duration_seconds: pick(cm.duration_seconds, rm.duration_seconds),
+    };
+    return { meta, fmt, fmts };
   };
-  const errs = [];
-  for (let i = 0; i < JX_HOSTS.length; i++) {
+  const done = (j) => j.status === "succeeded"; // POST 快路径响应里 status 已是 succeeded
+  let job = null;
+  let postErr = "pd-post=net";
+  for (let attempt = 0; attempt < 4 && !job; attempt++) {
+    if (attempt) await new Promise((res) => setTimeout(res, attempt * 2000));
+    try {
+      const r = await fetch("https://api.parsedock.kitt.tools/v1/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ url: vurl, action: "resolve" }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.ok) {
+        job = await r.json();
+        break;
+      }
+      postErr = `pd-post=${r.status}`;
+      if (r.status !== 503 && r.status !== 429 && r.status < 500) break; // 客户端错误不重试
+    } catch {
+      postErr = "pd-post=net";
+    }
+  }
+  if (!job) throw new Error(postErr);
+  if (done(job)) return extract(job);
+  if (!job.job_id || !job.job_token) throw new Error("pd-post=badjob");
+  let last = "pd=timeout";
+  for (let i = 0; i < 16; i++) {
+    await new Promise((res) => setTimeout(res, 1500));
     let r;
     try {
-      r = await fetch(`${JX_HOSTS[i]}/Api`, { method: "POST", body, headers, signal: AbortSignal.timeout(30000) });
+      r = await fetch(`https://api.parsedock.kitt.tools/v1/jobs/${job.job_id}`, {
+        headers: { Authorization: `Bearer ${job.job_token}` },
+        signal: AbortSignal.timeout(10000),
+      });
     } catch {
-      errs.push(`jx${i}=net`);
+      last = "pd=poll-net";
       continue;
     }
     if (!r.ok) {
-      errs.push(`jx${i}=${r.status}`);
+      last = `pd=${r.status}`;
       continue;
     }
     let j;
     try {
       j = await r.json();
     } catch {
-      errs.push(`jx${i}=badjson`);
+      last = "pd=badjson";
       continue;
     }
-    if (j.code !== 200 || !j.data || !j.key || !j.iv) {
-      errs.push(`jx${i}=${j?.code ?? "?"}`);
-      continue;
+    if (done(j)) return extract(j);
+    if (j.status === "failed" || j.status === "expired" || j.status === "cancelled") {
+      throw new Error(`pd=${j.status}`);
     }
+    last = `pd=${j.status}`;
+  }
+  throw new Error(last);
+}
+
+/** 外层重试：服务端间歇 503 / 空结果（nourl）时重跑整条 resolve；终态失败不重试。 */
+async function pdResolve(vurl) {
+  const RETRYABLE = /nourl|pd-post=(503|429|net)|pd=poll-net|pd=(timeout|queued|running)|pd=(408|425|429|5\d\d)$/;
+  let lastErr;
+  for (let round = 0; round < 3; round++) {
+    if (round) await new Promise((res) => setTimeout(res, round * 2000));
     try {
-      const plain = await aesCbc(new TextEncoder().encode(String(j.key)), String(j.iv), b64dec(j.data), false);
-      const text = new TextDecoder().decode(plain);
-      const obj = JSON.parse(text.slice(text.indexOf("{")));
-      if (!obj.url) {
-        errs.push(`jx${i}=nourl`);
-        continue;
-      }
-      return obj;
-    } catch {
-      errs.push(`jx${i}=dec`);
+      return await pdOnce(vurl);
+    } catch (e) {
+      lastErr = e;
+      if (!RETRYABLE.test(e.message)) throw e;
     }
   }
-  throw new Error(errs.join(", "));
+  throw lastErr;
 }
 
 // 412 风控与出口 IP 相关：不同 IP 段对 UA/host 的判定不同，依次尝试多组。
@@ -421,40 +439,43 @@ async function extractBili(url) {
     }
   }
   if (!view || !play) {
-    // B 站直连取流/元数据不通 → 第三方解析站换出口（返回流地址 + 标题/封面）
-    let jx = null;
-    let jxErr = null;
+    // B 站直连取流/元数据不通 → ParseDock 换出口（返回流地址 + 标题/封面）
+    let pd = null;
+    let pdErr = null;
     try {
-      jx = await jxParse(url);
+      pd = await pdResolve(url);
     } catch (e) {
-      jxErr = e;
+      pdErr = e;
     }
-    if (!jx) {
+    if (!pd) {
       const parts = [];
       if (viewErr) parts.push(viewErr.message);
       if (playErr) parts.push(playErr.message);
-      parts.push(`第三方兜底: ${jxErr?.message || "失败"}`);
+      parts.push(`ParseDock 兜底: ${pdErr?.message || "失败"}`);
       throw new Error(parts.join("；"));
     }
     const stat = (view && view.stat) || {};
-    const jxIsHls = /m3u8|hls/i.test(String(jx.type || "")) || /\.m3u8/i.test(String(jx.url || ""));
+    const { meta, fmt, fmts } = pd;
+    const height = fmt.height;
+    const quality = height ? `${height}P` : "MP4";
+    const qLabels = [...new Set(fmts.map((f) => (f.height ? `${f.height}P` : (f.label || "MP4"))))];
     return {
       source: "bilibili",
       bvid,
-      title: view?.title || jx.name || bvid,
-      author: view?.owner?.name,
-      duration: view?.duration,
+      title: view?.title || meta.title || bvid,
+      author: view?.owner?.name || meta.author,
+      duration: view?.duration || (meta.duration_seconds ? Math.round(meta.duration_seconds) : undefined),
       views: stat.view,
       likes: stat.like,
       danmaku: stat.danmaku,
-      thumbnail: view?.pic || jx.pic || null,
+      thumbnail: view?.pic || meta.thumbnail_url || null,
       qualities: play
         ? (play.support_formats || []).map((q) => ({ qn: q.quality, label: q.new_description || q.display_desc }))
-        : [{ qn: 80, label: "解析线路" }],
+        : qLabels.map((l) => ({ qn: 80, label: l })),
       quality: play
         ? QN_LABELS[play.quality] || String(play.quality)
-        : jxIsHls ? "HLS" : "MP4",
-      stream_url: (play?.durl || [])[0]?.url || jx.url,
+        : quality,
+      stream_url: (play?.durl || [])[0]?.url || fmt.source_url,
       page_url: `https://www.bilibili.com/video/${bvid}`,
     };
   }
