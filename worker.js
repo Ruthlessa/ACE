@@ -689,12 +689,119 @@ async function extractGeneric(url) {
   };
 }
 
+/* ---- 腾讯视频：h5vv6 getvinfo + ckey 签名（算法参考 yt-dlp tencent.py，本机 python 对拍通过） ---- */
+const QQ_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const QQ_KEY = new Uint8Array([0x4f, 0x6b, 0xda, 0xa3, 0x9e, 0x2f, 0x8c, 0xb0, 0x7f, 0x5e, 0x72, 0x2d, 0x9e, 0xde, 0xf3, 0x14]);
+const QQ_IV = new Uint8Array([0x01, 0x50, 0x4a, 0xf3, 0x56, 0xe6, 0x19, 0xcf, 0x2e, 0x42, 0xbb, 0xa6, 0x8c, 0x3f, 0x70, 0xf9]);
+const QQ_LABELS = { shd: "720P", fhd: "1080P", hd: "500P", sd: "480P", ld: "360P", ldm: "270P" };
+
+const hexOf = (u8) => [...u8].map((b) => b.toString(16).padStart(2, "0")).join("");
+const randStr = (n) => {
+  const cs = "0123456789abcdefghijklmnopqrstuvwxyz";
+  let s = "";
+  for (let i = 0; i < n; i++) s += cs[Math.floor(Math.random() * cs.length)];
+  return s;
+};
+
+/** ckey：payload 拼接 → |sum| 前缀 → 空格填充到 16 对齐 → AES-128-CBC → hex 大写（截掉 WebCrypto 的 PKCS7 尾块以等价 whitespace 填充） */
+async function qqCkey(vid, pageUrl, guid) {
+  const payload = `${vid}|${Math.floor(Date.now() / 1000)}|mg3c3b04ba|3.5.57|${guid}|10901|${pageUrl.slice(0, 48)}|${QQ_UA.toLowerCase().slice(0, 48)}||Mozilla|Netscape|Windows x86_64|00|`;
+  let sum = 0;
+  for (let i = 0; i < payload.length; i++) sum += payload.charCodeAt(i); // payload 全 ASCII
+  let pt = new TextEncoder().encode(`|${sum}|${payload}`);
+  const pad = (16 - (pt.length % 16)) % 16;
+  if (pad) {
+    const p = new Uint8Array(pt.length + pad);
+    p.fill(0x20);
+    p.set(pt);
+    pt = p;
+  }
+  const kc = await crypto.subtle.importKey("raw", QQ_KEY, "AES-CBC", false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CBC", iv: QQ_IV }, kc, pt));
+  return hexOf(ct.slice(0, ct.length - 16)).toUpperCase();
+}
+
+/** 腾讯视频页：/x/page/{vid}.html 或 /x/cover/{series}/{vid}.html → vid/cid 从 URL 直接提取 */
+async function extractVqq(url) {
+  const m = url.match(/v\.qq\.com\/x\/(?:page|cover\/(\w+))\/(\w+)\.html/);
+  if (!m) throw new Error("腾讯链接需为 /x/page/xxx.html 或 /x/cover/系列id/集id.html 格式");
+  const series = m[1] || "";
+  const vid = m[2];
+  const guid = randStr(16);
+  const q = new URLSearchParams({
+    vid,
+    cid: series,
+    cKey: await qqCkey(vid, url, guid),
+    encryptVer: "8.1",
+    spcaptiontype: "0",
+    sphls: "0",
+    dtype: "0",
+    defn: "shd",
+    spsrt: "2",
+    sphttps: "1",
+    otype: "json",
+    spwm: "1",
+    hevclv: "28",
+    drm: "40",
+    spvideo: "4",
+    spsfrhdr: "100",
+    host: "v.qq.com",
+    referer: "v.qq.com",
+    ehost: url,
+    appVer: "3.5.57",
+    platform: "10901",
+    guid,
+    flowid: randStr(32),
+  });
+  let r;
+  try {
+    r = await fetch(`https://h5vv6.video.qq.com/getvinfo?${q}`, {
+      headers: { "User-Agent": QQ_UA, Referer: "https://v.qq.com/" },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    throw new Error("vqq=net");
+  }
+  if (!r.ok) throw new Error(`vqq=http${r.status}`);
+  const text = await r.text();
+  const jm = text.match(/QZOutputJson=(\{[\s\S]*\})/);
+  if (!jm) throw new Error("vqq=nojson");
+  let j;
+  try {
+    j = JSON.parse(jm[1]);
+  } catch {
+    throw new Error("vqq=badjson");
+  }
+  if (j.code !== "0.0") throw new Error(`vqq=${j.code}${j.msg ? `:${String(j.msg).slice(0, 40)}` : ""}`);
+  const vi = j.vl?.vi?.[0];
+  const ui = vi?.ul?.ui || [];
+  const stream = ui.length && vi.fn && vi.fvkey ? `${ui[0].url}${vi.fn}?vkey=${vi.fvkey}` : null;
+  if (!stream) throw new Error("vqq=nostream");
+  const fi = j.fl?.fi || [];
+  return {
+    source: "v.qq.com",
+    title: vi.ti || null,
+    author: null,
+    duration: vi.td ? Math.round(vi.td) : null,
+    views: null,
+    likes: null,
+    danmaku: null,
+    thumbnail: null, // 腾讯页无 og:image，封面接口均已失效
+    qualities: fi.map((f) => ({ qn: f.br || 0, label: QQ_LABELS[f.name] || f.name })),
+    quality: QQ_LABELS[fi[0]?.name] || fi[0]?.name || "MP4",
+    stream_url: stream,
+    page_url: url,
+  };
+}
+
 /**
  * 非 B 站通用解析：og 页面元数据 → Loader.to → ParseDock。
  * og 拿到流直接返回（SSR 站）；SPA 站 og 缺流/失败时用兜底换出口（优酷/YouTube/抖音等）。
  */
 async function extract(url) {
   if (parseBvid(url)) return extractBili(url);
+  if (/v\.qq\.com\//.test(url)) return extractVqq(url); // 腾讯走专用签名接口
   let og = null;
   let ogErr = null;
   try {
