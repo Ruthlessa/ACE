@@ -298,6 +298,11 @@ async function loaderResolve(vurl) {
     }
   }
   if (!task) throw new Error(lastErr);
+  // 不支持的站点：create 返回的 title 是 URL 本身 / image 是 favicon（支持的站返回真实标题）
+  const ct = String(task.info?.title || "");
+  if (!task.download_url && (ct.includes("http") || /favicon|google\.com\/s2/.test(String(task.info?.image || "")))) {
+    throw new Error("loader=unsupported");
+  }
   const pack = (j) => ({
     stream_url: j.download_url,
     title: task.info?.title || j.info?.title,
@@ -305,6 +310,8 @@ async function loaderResolve(vurl) {
   });
   if (task.download_url && task.success) return pack(task);
   lastErr = "loader=timeout";
+  let stuck = 0;
+  let prevText = "";
   for (let i = 0; i < 16; i++) {
     await new Promise((res) => setTimeout(res, 3000));
     try {
@@ -319,7 +326,14 @@ async function loaderResolve(vurl) {
       const j = await r.json();
       if (j.download_url && j.success) return pack(j);
       if (j.error || j.success === -1) throw new Error(`loader=${j.error || "failed"}`);
-      lastErr = `loader=${j.text || "progress"}`;
+      const st = String(j.text || "progress");
+      if (st === prevText) stuck++;
+      else {
+        stuck = 0;
+        prevText = st;
+      }
+      if (st === "Initialising" && stuck >= 6) throw new Error("loader=stuck"); // 18s 无进展视为卡死
+      lastErr = `loader=${st}`;
     } catch (e) {
       if (String(e.message).startsWith("loader=")) throw e; // 业务失败（j.error）
       lastErr = "loader=progress-net";
