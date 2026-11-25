@@ -688,6 +688,36 @@ export default {
       return new Response(PAGE, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
+    if (pathname === "/api/img" && request.method === "GET") {
+      // B 站图床防盗链：外部 Referer 一律 403，反代时改写为 B 站 Referer 后透传
+      let u = null;
+      try {
+        u = new URL(searchParams.get("url") || "");
+      } catch {
+        /* 非法 URL → 400 */
+      }
+      const okHost =
+        u &&
+        (u.protocol === "https:" || u.protocol === "http:") &&
+        (u.hostname.endsWith(".hdslb.com") || u.hostname.endsWith(".bilibili.com"));
+      if (!okHost) return new Response("Bad Image URL", { status: 400 });
+      try {
+        const r = await fetch(u.toString(), {
+          headers: { Referer: "https://www.bilibili.com/", "User-Agent": DL_HEADERS["User-Agent"] },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!r.ok) return new Response(`上游 ${r.status}`, { status: 502 });
+        return new Response(r.body, {
+          headers: {
+            "Content-Type": r.headers.get("Content-Type") || "image/jpeg",
+            "Cache-Control": "public, max-age=86400",
+          },
+        });
+      } catch {
+        return new Response("Image Fetch Failed", { status: 502 });
+      }
+    }
+
     if (pathname === "/api/parse" && request.method === "POST") {
       let url = "";
       try {
@@ -700,6 +730,20 @@ export default {
       const start = Date.now();
       try {
         const info = await extract(url);
+        // B 站封面改走反代（图床对页面 Referer 防盗链 403）
+        if (info.thumbnail) {
+          const th = info.thumbnail.startsWith("//") ? `https:${info.thumbnail}` : info.thumbnail;
+          try {
+            const tu = new URL(th);
+            if (tu.hostname.endsWith(".hdslb.com") || tu.hostname.endsWith(".bilibili.com")) {
+              info.thumbnail = `/api/img?url=${encodeURIComponent(th)}`;
+            } else {
+              info.thumbnail = th;
+            }
+          } catch {
+            /* 保留原值 */
+          }
+        }
         info.elapsed_ms = Date.now() - start;
         return Response.json(info);
       } catch (e) {
