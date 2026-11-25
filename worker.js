@@ -657,11 +657,11 @@ async function extractGeneric(url) {
       html.match(new RegExp(`<meta[^>]+content="([^"]*)"[^>]+(?:property|name)="${name}"`, "i"));
     return m ? m[1].replace(/&amp;/g, "&") : null;
   };
-  const title = meta("og:title") || (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || null;
+  const title = (meta("og:title") || (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || "").trim();
   if (!title) throw new Error("页面中未找到视频标题");
   return {
     source: new URL(url).hostname,
-    title: title.trim(),
+    title,
     author: meta("og:site_name"),
     duration: null,
     views: null,
@@ -675,9 +675,56 @@ async function extractGeneric(url) {
   };
 }
 
+/**
+ * 非 B 站通用解析：og 页面元数据 → Loader.to → ParseDock。
+ * og 拿到流直接返回（SSR 站）；SPA 站 og 缺流/失败时用兜底换出口（优酷/YouTube/抖音等）。
+ */
 async function extract(url) {
   if (parseBvid(url)) return extractBili(url);
-  return extractGeneric(url);
+  let og = null;
+  let ogErr = null;
+  try {
+    og = await extractGeneric(url);
+  } catch (e) {
+    ogErr = e;
+  }
+  if (og && og.stream_url) return og; // og 自带流，直接用
+  const errs = [];
+  if (ogErr) errs.push(`页面解析: ${ogErr.message}`);
+  else errs.push("页面解析: 无流地址");
+  let alt = null;
+  try {
+    alt = loaderAdapt(await loaderResolve(url));
+  } catch (e) {
+    errs.push(`Loader 兜底: ${e.message}`);
+  }
+  if (!alt) {
+    try {
+      alt = await pdResolve(url);
+    } catch (e) {
+      errs.push(`ParseDock 兜底: ${e.message}`);
+    }
+  }
+  if (!alt) {
+    throw new Error(errs.join("；"));
+  }
+  const { meta: am, fmt, fmts } = alt;
+  return {
+    source: new URL(url).hostname,
+    title: og?.title || am.title || url,
+    author: og?.author || am.author || null,
+    duration: og?.duration ?? (am.duration_seconds ? Math.round(am.duration_seconds) : null),
+    views: og?.views ?? null,
+    likes: og?.likes ?? null,
+    danmaku: null,
+    thumbnail: og?.thumbnail || am.thumbnail_url || null,
+    qualities: og?.qualities?.length
+      ? og.qualities
+      : fmts.map((f) => ({ qn: f.height || 0, label: f.height ? `${f.height}P` : f.label || "MP4" })),
+    quality: og?.quality || (fmt.height ? `${fmt.height}P` : "MP4"),
+    stream_url: og?.stream_url || fmt.source_url,
+    page_url: url,
+  };
 }
 
 export default {
